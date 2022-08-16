@@ -42,6 +42,10 @@ int l3mdev_fib_rule_match(struct net *net, struct flowi *fl,
 
 void l3mdev_update_flow(struct net *net, struct flowi *fl);
 
+struct net_device *l3mdev_master_by_table(struct net *net, u32 table);
+
+int l3mdev_master_ifindex_by_table(struct net *net, u32 table);
+
 int l3mdev_master_ifindex_rcu(const struct net_device *dev);
 static inline int l3mdev_master_ifindex(struct net_device *dev)
 {
@@ -289,6 +293,18 @@ int l3mdev_fib_rule_match(struct net *net, struct flowi *fl,
 static inline
 void l3mdev_update_flow(struct net *net, struct flowi *fl)
 {
+}
+
+static inline
+struct net_device *l3mdev_master_by_table(struct net *net, u32 table)
+{
+	return NULL;
+}
+
+static inline
+int l3mdev_master_ifindex_by_table(struct net *net, u32 table)
+{
+	return 0;
 }
 #endif
 

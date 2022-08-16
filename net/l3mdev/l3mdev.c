@@ -214,3 +214,55 @@ out:
 	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(l3mdev_update_flow);
+
+struct net_device *l3mdev_master_by_table(struct net *net, u32 table)
+{
+	struct net_device *dev = NULL;
+	struct net_device *target = NULL;
+	u32 tbid;
+
+	rcu_read_lock();
+
+	for_each_netdev_rcu(net, dev) {
+		if (netif_is_l3_master(dev)) {
+			if (dev->l3mdev_ops && dev->l3mdev_ops->l3mdev_fib_table) {
+				tbid = dev->l3mdev_ops->l3mdev_fib_table(dev);
+				if (tbid == table) {
+					target = dev;
+					break;
+				}
+			}
+		}
+	}
+
+	rcu_read_unlock();
+
+	return target;
+}
+EXPORT_SYMBOL_GPL(l3mdev_master_by_table);
+
+int l3mdev_master_ifindex_by_table(struct net *net, u32 table)
+{
+	struct net_device *dev = NULL;
+	int ifindex = 0;
+	u32 tbid;
+
+	rcu_read_lock();
+
+	for_each_netdev_rcu(net, dev) {
+		if (netif_is_l3_master(dev)) {
+			if (dev->l3mdev_ops && dev->l3mdev_ops->l3mdev_fib_table) {
+				tbid = dev->l3mdev_ops->l3mdev_fib_table(dev);
+				if (tbid == table) {
+					ifindex = dev->ifindex;
+					break;
+				}
+			}
+		}
+	}
+
+	rcu_read_unlock();
+
+	return ifindex;
+}
+EXPORT_SYMBOL_GPL(l3mdev_master_ifindex_by_table);

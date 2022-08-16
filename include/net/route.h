@@ -202,6 +202,26 @@ static inline int ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
 	return err;
 }
 
+int ip_route_input_table_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+               u8 tos, struct net_device *dev, u32 table, u32 flags);
+
+static inline int ip_route_input_table(struct sk_buff *skb, __be32 dst, __be32 src,
+				 u8 tos, struct net_device *devin, u32 table, u32 flags)
+{
+	int err;
+
+	rcu_read_lock();
+	err = ip_route_input_table_rcu(skb, dst, src, tos, devin, table, flags);
+	if (!err) {
+		skb_dst_force(skb);
+		if (!skb_dst(skb))
+			err = -EINVAL;
+	}
+	rcu_read_unlock();
+
+	return err;
+}
+
 void ipv4_update_pmtu(struct sk_buff *skb, struct net *net, u32 mtu, int oif,
 		      u8 protocol);
 void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu);

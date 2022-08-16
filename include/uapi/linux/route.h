@@ -59,6 +59,7 @@ struct rtentry {
 #define RTF_WINDOW	0x0080		/* per route window clamping	*/
 #define RTF_IRTT	0x0100		/* Initial round trip time	*/
 #define RTF_REJECT	0x0200		/* Reject route			*/
+#define RTF_KNOWN_NH    0x0400  /* Known Nexthop */
 
 /*
  *	<linux/ipv6_route.h> uses RTF values >= 64k

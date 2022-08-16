@@ -1644,6 +1644,65 @@ static void rt_set_nexthop(struct rtable *rt, __be32 daddr,
 #endif
 }
 
+static void rt_set_gateway(struct rtable *rt, __be32 daddr,
+			   const struct fib_result *res,
+			   struct fib_nh_exception *fnhe,
+			   struct fib_info *fi, u16 type, u32 itag,
+			   u32 flags, const bool do_cache)
+{
+	bool cached = false;
+
+	if (fi) {
+		struct fib_nh_common *nhc = FIB_RES_NHC(*res);
+#ifdef CONFIG_IP_ROUTE_CLASSID
+		struct fib_nh *nh;
+#endif
+
+		if (nhc->nhc_gw.ipv4 && nhc->nhc_scope == RT_SCOPE_LINK) {
+			rt->rt_gw4 = nhc->nhc_gw.ipv4;
+			rt->rt_uses_gateway = 1;
+		}
+		dst_init_metrics(&rt->dst, fi->fib_metrics->metrics, true);
+		if (fi->fib_metrics != &dst_default_metrics) {
+			rt->dst._metrics |= DST_METRICS_REFCOUNTED;
+			refcount_inc(&fi->fib_metrics->refcnt);
+		}
+#ifdef CONFIG_IP_ROUTE_CLASSID
+		nh = container_of(nhc, struct fib_nh, nh_common);
+		rt->dst.tclassid = nh->nh_tclassid;
+#endif
+		rt->dst.lwtstate = lwtstate_get(nhc->nhc_lwtstate);
+		if (unlikely(fnhe))
+			cached = rt_bind_exception(rt, fnhe, daddr, do_cache);
+		else if (do_cache)
+			cached = rt_cache_route(nhc, rt);
+		if (unlikely(!cached)) {
+			/* Routes we intend to cache in nexthop exception or
+			 * FIB nexthop have the DST_NOCACHE bit clear.
+			 * However, if we are unsuccessful at storing this
+			 * route into the cache we really need to set it.
+			 */
+			if (!rt->rt_gw4)
+				rt->rt_gw4 = daddr;
+			rt_add_uncached_list(rt);
+		}
+
+		if (flags & RTF_KNOWN_NH) {
+			if (!rt->rt_gw4) {
+				rt->rt_gw4 = daddr;
+			}
+		}
+	} else
+		rt_add_uncached_list(rt);
+
+#ifdef CONFIG_IP_ROUTE_CLASSID
+#ifdef CONFIG_IP_MULTIPLE_TABLES
+	set_class_tag(rt, res->tclassid);
+#endif
+	set_class_tag(rt, itag);
+#endif
+}
+
 struct rtable *rt_dst_alloc(struct net_device *dev,
 			    unsigned int flags, u16 type,
 			    bool nopolicy, bool noxfrm, bool will_cache)
@@ -1898,6 +1957,97 @@ out:
 	return err;
 }
 
+static int __mkroute_input_table(struct sk_buff *skb,
+			   const struct fib_result *res,
+			   struct in_device *in_dev,
+			   __be32 daddr, __be32 saddr, u32 tos, u32 table, u32 flags)
+{
+	struct fib_nh_common *nhc = FIB_RES_NHC(*res);
+	struct net_device *dev = nhc->nhc_dev;
+	struct fib_nh_exception *fnhe;
+	struct rtable *rth;
+	int err;
+	struct in_device *out_dev;
+	bool do_cache;
+	u32 itag = 0;
+
+	/* get a working reference to the output device */
+	out_dev = __in_dev_get_rcu(dev);
+	if (!out_dev) {
+		net_crit_ratelimited("Bug in ip_route_input_slow(). Please report.\n");
+		return -EINVAL;
+	}
+
+	err = fib_validate_source_table(skb, saddr, daddr, tos, FIB_RES_OIF(*res),
+				  in_dev->dev, in_dev, &itag, table);
+	if (err < 0) {
+		ip_handle_martian_source(in_dev->dev, in_dev, skb, daddr,
+					 saddr);
+
+		goto cleanup;
+	}
+
+	do_cache = res->fi && !itag;
+	if (out_dev == in_dev && err && IN_DEV_TX_REDIRECTS(out_dev) &&
+	    skb->protocol == htons(ETH_P_IP)) {
+		__be32 gw;
+
+		gw = nhc->nhc_gw_family == AF_INET ? nhc->nhc_gw.ipv4 : 0;
+		if ((IN_DEV_SHARED_MEDIA(out_dev) ||
+			inet_addr_onlink(out_dev, saddr, gw)))
+			IPCB(skb)->flags |= IPSKB_DOREDIRECT;
+	}
+
+	if (skb->protocol != htons(ETH_P_IP)) {
+		/* Not IP (i.e. ARP). Do not create route, if it is
+		 * invalid for proxy arp. DNAT routes are always valid.
+		 *
+		 * Proxy arp feature have been extended to allow, ARP
+		 * replies back to the same interface, to support
+		 * Private VLAN switch technologies. See arp.c.
+		 */
+		if (out_dev == in_dev &&
+		    IN_DEV_PROXY_ARP_PVLAN(in_dev) == 0) {
+			err = -EINVAL;
+			goto cleanup;
+		}
+	}
+
+	fnhe = find_exception(nhc, daddr);
+	if (do_cache) {
+		if (fnhe)
+			rth = rcu_dereference(fnhe->fnhe_rth_input);
+		else
+			rth = rcu_dereference(nhc->nhc_rth_input);
+		if (rt_cache_valid(rth)) {
+			skb_dst_set_noref(skb, &rth->dst);
+			goto out;
+		}
+	}
+
+	rth = rt_dst_alloc(out_dev->dev, 0, res->type,
+			   IN_DEV_CONF_GET(in_dev, NOPOLICY),
+			   IN_DEV_CONF_GET(out_dev, NOXFRM), do_cache);
+	if (!rth) {
+		err = -ENOBUFS;
+		goto cleanup;
+	}
+
+	rth->rt_is_input = 1;
+	RT_CACHE_STAT_INC(in_slow_tot);
+
+	rth->dst.input = ip_forward;
+
+	rt_set_gateway(rth, daddr, res, fnhe, res->fi, res->type, itag,
+		       flags, do_cache);
+	lwtunnel_set_redirect(&rth->dst);
+	skb_dst_set(skb, &rth->dst);
+out:
+	err = 0;
+ cleanup:
+	return err;
+}
+
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 /* To make ICMP packets follow the right flow, the multipath hash is
  * calculated from the inner IP addresses.
@@ -2063,6 +2213,24 @@ static struct net_device *ip_rt_get_dev(struct net *net,
 		dev = l3mdev_master_dev_rcu(nhc->nhc_dev);
 
 	return dev ? : net->loopback_dev;
+}
+
+static int ip_mkroute_input_table(struct sk_buff *skb,
+			    struct fib_result *res,
+			    struct in_device *in_dev,
+			    __be32 daddr, __be32 saddr, u32 tos,
+			    struct flow_keys *hkeys, u32 table, u32 flags)
+{
+#ifdef CONFIG_IP_ROUTE_MULTIPATH
+	if (res->fi && res->fi->fib_nhs > 1) {
+		int h = fib_multipath_hash(res->fi->fib_net, NULL, skb, hkeys);
+
+		fib_select_multipath(res, h);
+	}
+#endif
+
+	/* create a routing cache entry */
+	return __mkroute_input_table(skb, res, in_dev, daddr, saddr, tos, table, flags);
 }
 
 /*
@@ -2285,6 +2453,234 @@ martian_source:
 	ip_handle_martian_source(dev, in_dev, skb, daddr, saddr);
 	goto out;
 }
+
+static int ip_route_input_slow_table(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+			       u8 tos, struct net_device *dev, u32 table, u32 rt_flags,
+			       struct fib_result *res)
+{
+	struct in_device *in_dev = __in_dev_get_rcu(dev);
+	struct flow_keys *flkeys = NULL, _flkeys;
+	struct net    *net = dev_net(dev);
+	struct ip_tunnel_info *tun_info;
+	int		err = -EINVAL;
+	unsigned int	flags = 0;
+	u32		itag = 0;
+	struct rtable	*rth;
+	struct flowi4	fl4;
+	bool do_cache = true;
+
+	/* IP on this device is disabled. */
+
+	if (!in_dev)
+		goto out;
+
+	/* Check for the most weird martians, which can be not detected
+	   by fib_lookup.
+	 */
+
+	tun_info = skb_tunnel_info(skb);
+	if (tun_info && !(tun_info->mode & IP_TUNNEL_INFO_TX))
+		fl4.flowi4_tun_key.tun_id = tun_info->key.tun_id;
+	else
+		fl4.flowi4_tun_key.tun_id = 0;
+	skb_dst_drop(skb);
+
+	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr))
+		goto martian_source;
+
+	res->fi = NULL;
+	res->table = NULL;
+	if (ipv4_is_lbcast(daddr) || (saddr == 0 && daddr == 0))
+		goto brd_input;
+
+	/* Accept zero addresses only to limited broadcast;
+	 * I even do not know to fix it or not. Waiting for complains :-)
+	 */
+	if (ipv4_is_zeronet(saddr))
+		goto martian_source;
+
+	if (ipv4_is_zeronet(daddr))
+		goto martian_destination;
+
+	/* Following code try to avoid calling IN_DEV_NET_ROUTE_LOCALNET(),
+	 * and call it once if daddr or/and saddr are loopback addresses
+	 */
+	if (ipv4_is_loopback(daddr)) {
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			goto martian_destination;
+	} else if (ipv4_is_loopback(saddr)) {
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			goto martian_source;
+	}
+
+	/*
+	 *	Now we are ready to route packet.
+	 */
+	fl4.flowi4_oif = 0;
+	fl4.flowi4_iif = dev->ifindex;
+	fl4.flowi4_mark = skb->mark;
+	fl4.flowi4_tos = tos;
+	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+	fl4.flowi4_flags = 0;
+	fl4.daddr = daddr;
+	fl4.saddr = saddr;
+	fl4.flowi4_uid = sock_net_uid(net, NULL);
+
+	if (table) {
+		fl4.flowi4_oif = l3mdev_master_ifindex_by_table(net, table);
+	}
+
+	if (fib4_rules_early_flow_dissect(net, skb, &fl4, &_flkeys)) {
+		flkeys = &_flkeys;
+	} else {
+		fl4.flowi4_proto = 0;
+		fl4.fl4_sport = 0;
+		fl4.fl4_dport = 0;
+	}
+
+	err = fib_lookup(net, &fl4, res, 0);
+	if (err != 0) {
+		if (!IN_DEV_FORWARD(in_dev))
+			err = -EHOSTUNREACH;
+		goto no_route;
+	}
+
+	if (res->type == RTN_BROADCAST) {
+		if (IN_DEV_BFORWARD(in_dev))
+			goto make_route;
+		/* not do cache if bc_forwarding is enabled */
+		if (IPV4_DEVCONF_ALL(net, BC_FORWARDING))
+			do_cache = false;
+		goto brd_input;
+	}
+
+	if (res->type == RTN_LOCAL) {
+		err = fib_validate_source_table(skb, saddr, daddr, tos,
+					  0, dev, in_dev, &itag, table);
+		if (err < 0)
+			goto martian_source;
+		goto local_input;
+	}
+
+	if (!IN_DEV_FORWARD(in_dev)) {
+		err = -EHOSTUNREACH;
+		goto no_route;
+	}
+	if (res->type != RTN_UNICAST)
+		goto martian_destination;
+
+make_route:
+	err = ip_mkroute_input_table(skb, res, in_dev, daddr, saddr, tos, flkeys, table, rt_flags);
+out:	return err;
+
+brd_input:
+	if (skb->protocol != htons(ETH_P_IP))
+		goto e_inval;
+
+	if (!ipv4_is_zeronet(saddr)) {
+		err = fib_validate_source_table(skb, saddr, 0, tos, 0, dev,
+					  in_dev, &itag, table);
+		if (err < 0)
+			goto martian_source;
+	}
+	flags |= RTCF_BROADCAST;
+	res->type = RTN_BROADCAST;
+	RT_CACHE_STAT_INC(in_brd);
+
+local_input:
+	do_cache &= res->fi && !itag;
+	if (do_cache) {
+		struct fib_nh_common *nhc = FIB_RES_NHC(*res);
+
+		rth = rcu_dereference(nhc->nhc_rth_input);
+		if (rt_cache_valid(rth)) {
+			skb_dst_set_noref(skb, &rth->dst);
+			err = 0;
+			goto out;
+		}
+	}
+
+	rth = rt_dst_alloc(l3mdev_master_dev_rcu(dev) ? : net->loopback_dev,
+			   flags | RTCF_LOCAL, res->type,
+			   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, do_cache);
+	if (!rth)
+		goto e_nobufs;
+
+	rth->dst.output= ip_rt_bug;
+#ifdef CONFIG_IP_ROUTE_CLASSID
+	rth->dst.tclassid = itag;
+#endif
+	rth->rt_is_input = 1;
+
+	RT_CACHE_STAT_INC(in_slow_tot);
+	if (res->type == RTN_UNREACHABLE) {
+		rth->dst.input= ip_error;
+		rth->dst.error= -err;
+		rth->rt_flags 	&= ~RTCF_LOCAL;
+	}
+
+	if (do_cache) {
+		struct fib_nh_common *nhc = FIB_RES_NHC(*res);
+
+		rth->dst.lwtstate = lwtstate_get(nhc->nhc_lwtstate);
+		if (lwtunnel_input_redirect(rth->dst.lwtstate)) {
+			WARN_ON(rth->dst.input == lwtunnel_input);
+			rth->dst.lwtstate->orig_input = rth->dst.input;
+			rth->dst.input = lwtunnel_input;
+		}
+
+		if (unlikely(!rt_cache_route(nhc, rth)))
+			rt_add_uncached_list(rth);
+	}
+	skb_dst_set(skb, &rth->dst);
+	err = 0;
+	goto out;
+
+no_route:
+	RT_CACHE_STAT_INC(in_no_route);
+	res->type = RTN_UNREACHABLE;
+	res->fi = NULL;
+	res->table = NULL;
+	goto local_input;
+
+	/*
+	 *	Do not cache martian addresses: they should be logged (RFC1812)
+	 */
+martian_destination:
+	RT_CACHE_STAT_INC(in_martian_dst);
+#ifdef CONFIG_IP_ROUTE_VERBOSE
+	if (IN_DEV_LOG_MARTIANS(in_dev))
+		net_warn_ratelimited("martian destination %pI4 from %pI4, dev %s\n",
+				     &daddr, &saddr, dev->name);
+#endif
+
+e_inval:
+	err = -EINVAL;
+	goto out;
+
+e_nobufs:
+	err = -ENOBUFS;
+	goto out;
+
+martian_source:
+	ip_handle_martian_source(dev, in_dev, skb, daddr, saddr);
+	goto out;
+}
+
+int ip_route_input_table_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+		       u8 tos, struct net_device *dev, u32 table, u32 flags)
+{
+	struct fib_result res;
+	int err;
+
+	tos &= IPTOS_RT_MASK;
+	rcu_read_lock();
+	err = ip_route_input_slow_table(skb, daddr, saddr, tos, dev, table, flags, &res);
+	rcu_read_unlock();
+
+	return err;
+}
+EXPORT_SYMBOL(ip_route_input_table_rcu);
 
 int ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 			 u8 tos, struct net_device *dev)

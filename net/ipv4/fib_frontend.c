@@ -427,6 +427,82 @@ e_rpf:
 	return -EXDEV;
 }
 
+static int __fib_validate_source_table(struct sk_buff *skb, __be32 src, __be32 dst,
+				 u8 tos, int oif, struct net_device *dev,
+				 int rpf, struct in_device *idev, u32 *itag, u32 table)
+{
+	struct net *net = dev_net(dev);
+	struct flow_keys flkeys;
+	int ret, no_addr;
+	struct fib_result res;
+	struct flowi4 fl4;
+	bool dev_match;
+
+	fl4.flowi4_oif = 0;
+	fl4.flowi4_iif = l3mdev_master_ifindex_rcu(dev);
+	if (!fl4.flowi4_iif)
+		fl4.flowi4_iif = oif ? : LOOPBACK_IFINDEX;
+	fl4.daddr = src;
+	fl4.saddr = dst;
+	fl4.flowi4_tos = tos;
+	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+	fl4.flowi4_tun_key.tun_id = 0;
+	fl4.flowi4_flags = 0;
+	fl4.flowi4_uid = sock_net_uid(net, NULL);
+
+	if (table) {
+		fl4.flowi4_iif = l3mdev_master_ifindex_by_table(net, table);
+	}
+
+	no_addr = idev->ifa_list == NULL;
+
+	fl4.flowi4_mark = IN_DEV_SRC_VMARK(idev) ? skb->mark : 0;
+	if (!fib4_rules_early_flow_dissect(net, skb, &fl4, &flkeys)) {
+		fl4.flowi4_proto = 0;
+		fl4.fl4_sport = 0;
+		fl4.fl4_dport = 0;
+	}
+
+	if (fib_lookup(net, &fl4, &res, 0))
+		goto last_resort;
+	if (res.type != RTN_UNICAST &&
+	    (res.type != RTN_LOCAL || !IN_DEV_ACCEPT_LOCAL(idev)))
+		goto e_inval;
+	fib_combine_itag(itag, &res);
+
+	dev_match = fib_info_nh_uses_dev(res.fi, dev);;
+	dev_match = dev_match || (res.type == RTN_LOCAL &&
+				  dev == net->loopback_dev);
+
+	if (dev_match) {
+		ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
+		return ret;
+	}
+	if (no_addr)
+		goto last_resort;
+	if (rpf == 1)
+		goto e_rpf;
+	fl4.flowi4_oif = dev->ifindex;
+
+	ret = 0;
+	if (fib_lookup(net, &fl4, &res, FIB_LOOKUP_IGNORE_LINKSTATE) == 0) {
+		if (res.type == RTN_UNICAST)
+			ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
+	}
+	return ret;
+
+last_resort:
+	if (rpf)
+		goto e_rpf;
+	*itag = 0;
+	return 0;
+
+e_inval:
+	return -EINVAL;
+e_rpf:
+	return -EXDEV;
+}
+
 /* Ignore rp_filter for packets protected by IPsec. */
 int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 			u8 tos, int oif, struct net_device *dev,
@@ -456,6 +532,36 @@ ok:
 
 full_check:
 	return __fib_validate_source(skb, src, dst, tos, oif, dev, r, idev, itag);
+}
+
+int fib_validate_source_table(struct sk_buff *skb, __be32 src, __be32 dst,
+			u8 tos, int oif, struct net_device *dev,
+			struct in_device *idev, u32 *itag, u32 table)
+{
+	int r = secpath_exists(skb) ? 0 : IN_DEV_RPFILTER(idev);
+	struct net *net = dev_net(dev);
+
+	if (!r && !fib_num_tclassid_users(net) &&
+	    (dev->ifindex != oif || !IN_DEV_TX_REDIRECTS(idev))) {
+		if (IN_DEV_ACCEPT_LOCAL(idev))
+			goto ok;
+		/* with custom local routes in place, checking local addresses
+		 * only will be too optimistic, with custom rules, checking
+		 * local addresses only can be too strict, e.g. due to vrf
+		 */
+		if (net->ipv4.fib_has_custom_local_routes ||
+		    fib4_has_custom_rules(net))
+			goto full_check;
+		if (inet_lookup_ifaddr_rcu(net, src))
+			return -EINVAL;
+
+ok:
+		*itag = 0;
+		return 0;
+	}
+
+full_check:
+	return __fib_validate_source_table(skb, src, dst, tos, oif, dev, r, idev, itag, table);
 }
 
 static inline __be32 sk_extract_addr(struct sockaddr *addr)
