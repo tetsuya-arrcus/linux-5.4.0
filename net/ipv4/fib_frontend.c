@@ -449,6 +449,7 @@ static int __fib_validate_source_table(struct sk_buff *skb, __be32 src, __be32 d
 	fl4.flowi4_tun_key.tun_id = 0;
 	fl4.flowi4_flags = 0;
 	fl4.flowi4_uid = sock_net_uid(net, NULL);
+	fl4.flowi4_multipath_hash = 0;
 
 	if (table) {
 		fl4.flowi4_iif = l3mdev_master_ifindex_by_table(net, table);
@@ -461,10 +462,14 @@ static int __fib_validate_source_table(struct sk_buff *skb, __be32 src, __be32 d
 		fl4.flowi4_proto = 0;
 		fl4.fl4_sport = 0;
 		fl4.fl4_dport = 0;
+	} else {
+		swap(fl4.fl4_sport, fl4.fl4_dport);
 	}
 
-	if (fib_lookup(net, &fl4, &res, 0))
+	if ((ret = fib_lookup(net, &fl4, &res, 0))) {
+		pr_info("%s: fib_lookup result %d\n", __FUNCTION__, ret);
 		goto last_resort;
+	}
 	if (res.type != RTN_UNICAST &&
 	    (res.type != RTN_LOCAL || !IN_DEV_ACCEPT_LOCAL(idev)))
 		goto e_inval;
@@ -478,8 +483,10 @@ static int __fib_validate_source_table(struct sk_buff *skb, __be32 src, __be32 d
 		ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
 		return ret;
 	}
-	if (no_addr)
+	if (no_addr) {
+		pr_info("%s: no_addr is %d\n", __FUNCTION__, no_addr);
 		goto last_resort;
+	}
 	if (rpf == 1)
 		goto e_rpf;
 	fl4.flowi4_oif = dev->ifindex;

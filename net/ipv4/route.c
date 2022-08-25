@@ -1654,22 +1654,25 @@ static void rt_set_gateway(struct rtable *rt, __be32 daddr,
 
 	if (fi) {
 		struct fib_nh_common *nhc = FIB_RES_NHC(*res);
-#ifdef CONFIG_IP_ROUTE_CLASSID
-		struct fib_nh *nh;
-#endif
 
 		if (nhc->nhc_gw.ipv4 && nhc->nhc_scope == RT_SCOPE_LINK) {
-			rt->rt_gw4 = nhc->nhc_gw.ipv4;
 			rt->rt_uses_gateway = 1;
+			rt->rt_gw_family = nhc->nhc_gw_family;
+			if (likely(nhc->nhc_gw_family == AF_INET))
+				rt->rt_gw4 = nhc->nhc_gw.ipv4;
+			else
+				rt->rt_gw6 = nhc->nhc_gw.ipv6;
 		}
-		dst_init_metrics(&rt->dst, fi->fib_metrics->metrics, true);
-		if (fi->fib_metrics != &dst_default_metrics) {
-			rt->dst._metrics |= DST_METRICS_REFCOUNTED;
-			refcount_inc(&fi->fib_metrics->refcnt);
-		}
+
+		ip_dst_init_metrics(&rt->dst, fi->fib_metrics);
+
 #ifdef CONFIG_IP_ROUTE_CLASSID
-		nh = container_of(nhc, struct fib_nh, nh_common);
-		rt->dst.tclassid = nh->nh_tclassid;
+		if (nhc->nhc_family == AF_INET) {
+			struct fib_nh *nh;
+
+			nh = container_of(nhc, struct fib_nh, nh_common);
+			rt->dst.tclassid = nh->nh_tclassid;
+		}
 #endif
 		rt->dst.lwtstate = lwtstate_get(nhc->nhc_lwtstate);
 		if (unlikely(fnhe))
@@ -1682,13 +1685,16 @@ static void rt_set_gateway(struct rtable *rt, __be32 daddr,
 			 * However, if we are unsuccessful at storing this
 			 * route into the cache we really need to set it.
 			 */
-			if (!rt->rt_gw4)
+			if (!rt->rt_gw4) {
+				rt->rt_gw_family = AF_INET;
 				rt->rt_gw4 = daddr;
+			}
 			rt_add_uncached_list(rt);
 		}
 
 		if (flags & RTF_KNOWN_NH) {
 			if (!rt->rt_gw4) {
+				rt->rt_gw_family = AF_INET;
 				rt->rt_gw4 = daddr;
 			}
 		}
@@ -2222,7 +2228,7 @@ static int ip_mkroute_input_table(struct sk_buff *skb,
 			    struct flow_keys *hkeys, u32 table, u32 flags)
 {
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-	if (res->fi && res->fi->fib_nhs > 1) {
+	if (res->fi && fib_info_num_path(res->fi) > 1) {
 		int h = fib_multipath_hash(res->fi->fib_net, NULL, skb, hkeys);
 
 		fib_select_multipath(res, h);
@@ -2525,6 +2531,7 @@ static int ip_route_input_slow_table(struct sk_buff *skb, __be32 daddr, __be32 s
 	fl4.daddr = daddr;
 	fl4.saddr = saddr;
 	fl4.flowi4_uid = sock_net_uid(net, NULL);
+	fl4.flowi4_multipath_hash = 0;
 
 	if (table) {
 		fl4.flowi4_oif = l3mdev_master_ifindex_by_table(net, table);

@@ -32,6 +32,9 @@
 #include <linux/etherdevice.h>
 #include <linux/bpf.h>
 
+#define LEGACY_DT4 1
+#define LEGACY_DT6 1
+
 struct seg6_local_lwt;
 
 struct seg6_action_desc {
@@ -623,6 +626,82 @@ drop:
 	return -EINVAL;
 }
 
+#ifndef LEGACY_DT4
+static struct sk_buff *end_dt_vrf_rcv(struct sk_buff *skb,
+								      u16 family,
+									  struct net_device *dev)
+{
+    /* based on l3mdev_ip_rcv; we are only interested in the master */
+    if (unlikely(!netif_is_l3_master(dev) && !netif_has_l3_rx_handler(dev))) {
+                   netif_is_l3_master(dev), netif_has_l3_rx_handler(dev), dev->name);
+            goto drop;
+    }
+
+    if (unlikely(!dev->l3mdev_ops->l3mdev_l3_rcv)) {
+            goto drop;
+    }
+
+    /* the decap packet IPv4/IPv6 does not come with any mac header info.
+     * We must unset the mac header to allow the VRF device to rebuild it,
+     * just in case there is a sniffer attached on the device.
+     */
+    skb_reset_mac_header(skb);
+
+    skb = dev->l3mdev_ops->l3mdev_l3_rcv(dev, skb, family);
+    if (!skb)
+            /* the skb buffer was consumed by the handler */
+            return NULL;
+
+    /* when a packet is received by a VRF or by one of its slaves, the
+     * master device reference is set into the skb.
+     */
+    if (unlikely(skb->dev != dev || skb->skb_iif != dev->ifindex)) {
+                    skb->dev->name, dev->name, skb->skb_iif, dev->ifindex);
+            goto drop;
+    }
+
+    return skb;
+
+drop:
+	kfree_skb(skb);
+	return NULL;
+}
+
+static struct sk_buff *end_dt_vrf_core(struct sk_buff *skb,
+                                       struct seg6_local_lwt *slwt,
+									   u16 family)
+{
+	struct net *net = dev_net(skb->dev);
+	struct net_device *vrf;
+
+
+	vrf = l3mdev_master_by_table(net, slwt->table);
+	if (! vrf) {
+		return NULL;
+	}
+
+	if (family == AF_INET) {
+		skb->protocol = htons(ETH_P_IP);
+		skb_set_transport_header(skb, sizeof(struct iphdr));
+	} else if (family == AF_INET6) {
+		skb->protocol = htons(ETH_P_IPV6);
+		skb_set_transport_header(skb, sizeof(struct ipv6hdr));
+	} else {
+		goto drop;
+	}
+
+	skb_dst_drop(skb);
+
+	nf_reset_ct(skb);
+
+	return end_dt_vrf_rcv (skb, family, vrf);
+
+drop:
+	kfree_skb(skb);
+	return NULL;
+}
+#endif
+
 static int input_action_end_dt4(struct sk_buff *skb,
                                 struct seg6_local_lwt *slwt)
 {
@@ -630,8 +709,10 @@ static int input_action_end_dt4(struct sk_buff *skb,
 	struct iphdr *iph;
 	int err;
 	u32 next_usid;
+#ifdef LEGACY_DT4
 	struct net *net;
 	struct net_device *dev;
+#endif
 
 	ip6 = ipv6_hdr(skb);
 	if (!ip6)
@@ -650,15 +731,16 @@ static int input_action_end_dt4(struct sk_buff *skb,
 	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
 		goto drop;
 
+#ifdef LEGACY_DT4
 	skb->protocol = htons(ETH_P_IP);
+	skb_dst_drop(skb);
+	skb_set_transport_header(skb, sizeof(struct iphdr));
 
 	iph = ip_hdr(skb);
 
-	skb_dst_drop(skb);
-
 	err = ip_route_input_table(skb, iph->daddr, iph->saddr, 0, skb->dev,
-				slwt->table, 0);
-	if (err) {
+						slwt->table, 0);
+	if (unlikely(err)) {
 		goto drop;
 	}
 
@@ -666,12 +748,29 @@ static int input_action_end_dt4(struct sk_buff *skb,
 		net = dev_net(skb_dst(skb)->dev);
 
 		dev = l3mdev_master_by_table(net, slwt->table);
-		if (dev)
+		if (dev) {
 			skb->dev = dev;
+			IPCB(skb)->iif = skb->skb_iif = dev->ifindex;
+		}
 
 		IPCB(skb)->flags |= IPSKB_L3SLAVE;
-		IPCB(skb)->iif = l3mdev_master_ifindex_by_table (net, slwt->table);
 	}
+#else
+	skb = end_dt_vrf_core(skb, slwt, AF_INET);
+	if (!skb)
+		return 0;
+
+	if (IS_ERR(skb)) {
+		goto drop;
+	}
+
+	iph = ip_hdr(skb);
+
+	err = ip_route_input(skb, iph->daddr, iph->saddr, 0, skb->dev);
+	if (unlikely(err)) {
+		goto drop;
+	}
+#endif
 
 	return dst_input(skb);
 
@@ -680,8 +779,8 @@ drop:
 		return 0;
 	}
 
-        kfree_skb(skb);
-        return -EINVAL;
+	kfree_skb(skb);
+	return -EINVAL;
 }
 
 static int input_action_end_dt6(struct sk_buff *skb,
@@ -709,6 +808,16 @@ static int input_action_end_dt6(struct sk_buff *skb,
 	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
 		goto drop;
 
+#ifndef LEGACY_DT6
+	skb = end_dt_vrf_core(skb, slwt, AF_INET6);
+	if (!skb)
+		return 0
+
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+
+	seg6_lookup_nexthop(skb, NULL, slwt->table);
+#else
 	skb_set_transport_header(skb, sizeof(struct ipv6hdr));
 
 	seg6_lookup_nexthop(skb, NULL, slwt->table);
@@ -717,14 +826,16 @@ static int input_action_end_dt6(struct sk_buff *skb,
 		net = dev_net(skb_dst(skb)->dev);
 
 		dev = l3mdev_master_by_table(net, slwt->table);
-		if (dev)
+		if (dev) {
 			skb->dev = dev;
+			IP6CB(skb)->iif = skb->skb_iif = dev->ifindex;
+		}
 
 		IP6CB(skb)->flags |= IP6SKB_L3SLAVE;
-		IP6CB(skb)->iif = l3mdev_master_ifindex_by_table(net, slwt->table);
 	}
 
     skb->skb_iif = skb_dst(skb)->dev->ifindex;
+#endif
 
 	return dst_input(skb);
 
@@ -1490,17 +1601,17 @@ static int parse_nla_usid(struct nlattr **attrs, struct seg6_local_lwt *slwt)
 	len = nla_len(attrs[SEG6_LOCAL_USID]);
 
 	if (len != sizeof(struct sr6_usid_info)) {
-		printk(KERN_ERR "Invalid attribute length (%d)\n", len);
+		pr_info("Invalid attribute length (%d)\n", len);
 		return -EINVAL;
 	}
 
 	if ((usid->usid_block_len % 8) != 0) {
-		printk(KERN_ERR "Invalid usid block length (%d)\n", usid->usid_block_len);
+		pr_info("Invalid usid block length (%d)\n", usid->usid_block_len);
 		return -EINVAL;
 	}
 
 	if (usid->usid_len != 16 && usid->usid_len != 32 && usid->usid_len != 48) {
-		printk(KERN_ERR "Invalid usid length (%d)\n", usid->usid_len);
+		pr_info("Invalid usid length (%d)\n", usid->usid_len);
 		return -EINVAL;
 	}
 
