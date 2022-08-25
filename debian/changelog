@@ -1,4 +1,4 @@
-linux-5.4.195 (5.4.195-arrcus1) focal; urgency=low
+linux-5.4.195-arruc (5.4.195-arrcus1) focal; urgency=low
 
   * Custom built Linux kernel.
   * Support SRv6 functions fully.

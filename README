@@ -28,4 +28,4 @@ The following is required to build the linux kernel package.
 # ./scripts/config --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS ""
 
 4. Run "make deb-pkg"
-# make deb-pkg LOCALVERSION=-arrcus KDEB_PKGVERSION=$(make kernelversion)-1
+# make deb-pkg LOCALVERSION=-arrcus
