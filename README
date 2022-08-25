@@ -16,3 +16,16 @@ several of them using the Restructured Text markup notation.
 Please read the Documentation/process/changes.rst file, as it contains the
 requirements for building and running the kernel, and information about
 the problems which may result by upgrading your kernel.
+
+The following is required to build the linux kernel package.
+
+1. Extract linux kernel source
+# tar xvjpf linux-source-5.4.0.tar.bz2
+
+2. Copy the config file to .config
+
+3. Disable the following kernel parameters
+# ./scripts/config --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS ""
+
+4. Run "make deb-pkg"
+# make deb-pkg LOCALVERSION=-arrcus KDEB_PKGVERSION=$(make kernelversion)-1
