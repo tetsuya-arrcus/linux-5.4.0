@@ -37,6 +37,8 @@
 
 struct seg6_local_lwt;
 
+static struct sk_buff *end_dt_vrf_core(struct sk_buff *skb, struct seg6_local_lwt *slwt, u16 family);
+
 struct seg6_action_desc {
 	int action;
 	unsigned long attrs;
@@ -528,6 +530,8 @@ static int input_action_end_dx6(struct sk_buff *skb,
 	struct in6_addr *nhaddr = NULL;
 	struct ipv6hdr *ip6;
 	u32 next_usid;
+	struct net *net;
+	struct net_device *dev;
 
 	ip6 = ipv6_hdr(skb);
 	if (!ip6)
@@ -557,10 +561,25 @@ static int input_action_end_dx6(struct sk_buff *skb,
 	 * inner packet's DA. Otherwise, use the specified nexthop.
 	 */
 
+	if (slwt->table) {
+		net = dev_net(skb_dst(skb)->dev);
+
+		dev = l3mdev_master_by_table(net, slwt->table);
+		if (dev) {
+			skb->dev = dev;
+			IP6CB(skb)->iif = skb->skb_iif = dev->ifindex;
+		}
+
+		IP6CB(skb)->flags |= IP6SKB_L3SLAVE;
+	}
+
 	if (!ipv6_addr_any(&slwt->nh6))
 		nhaddr = &slwt->nh6;
 
+	skb->protocol = htons(ETH_P_IPV6);
 	skb_set_transport_header(skb, sizeof(struct ipv6hdr));
+
+	skb_dst_drop(skb);
 
 	seg6_lookup_nexthop_iface(skb, nhaddr, slwt->oif, slwt->table);
 
@@ -582,6 +601,10 @@ static int input_action_end_dx4(struct sk_buff *skb,
 	__be32 nhaddr;
 	int err;
 	u32 next_usid;
+#ifdef LEGACY_DT4
+	struct net *net;
+	struct net_device *dev;
+#endif
 
 	ip6 = ipv6_hdr(skb);
 	if (!ip6)
@@ -600,20 +623,48 @@ static int input_action_end_dx4(struct sk_buff *skb,
 	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
 		goto drop;
 
+#ifdef LEGACY_DT4
+	if (slwt->table) {
+		net = dev_net(skb_dst(skb)->dev);
+
+		dev = l3mdev_master_by_table(net, slwt->table);
+		if (dev) {
+			skb->dev = dev;
+			IPCB(skb)->iif = skb->skb_iif = dev->ifindex;
+		}
+
+		IPCB(skb)->flags |= IPSKB_L3SLAVE;
+	}
+
 	skb->protocol = htons(ETH_P_IP);
+	skb_dst_drop(skb);
+	skb_set_transport_header(skb, sizeof(struct iphdr));
 
 	iph = ip_hdr(skb);
 
 	nhaddr = slwt->nh4.s_addr ? slwt->nh4.s_addr : iph->daddr;
 
-	skb_dst_drop(skb);
-
-	skb_set_transport_header(skb, sizeof(struct iphdr));
-
 	err = ip_route_input_table(skb, nhaddr, iph->saddr, 0, skb->dev,
 			slwt->table, RTF_KNOWN_NH);
 	if (err)
 		goto drop;
+#else
+	skb = end_dt_vrf_core(skb, slwt, AF_INET);
+	if (!skb)
+		return 0;
+
+	if (IS_ERR(skb)) {
+		goto drop;
+	}
+
+	iph = ip_hdr(skb);
+
+	nhaddr = slwt->nh4.s_addr ? slwt->nh4.s_addr : iph->daddr;
+
+	err = ip_route_input(skb, nhaddr, iph->saddr, 0, skb->dev);
+	if (unlikely(err))
+		goto drop;
+#endif
 
 	return dst_input(skb);
 
@@ -626,41 +677,40 @@ drop:
 	return -EINVAL;
 }
 
-#ifndef LEGACY_DT4
+#if defined(LEGACY_DT4) && defined( LEGACY_DT6)
+#else
 static struct sk_buff *end_dt_vrf_rcv(struct sk_buff *skb,
 								      u16 family,
 									  struct net_device *dev)
 {
-    /* based on l3mdev_ip_rcv; we are only interested in the master */
-    if (unlikely(!netif_is_l3_master(dev) && !netif_has_l3_rx_handler(dev))) {
-                   netif_is_l3_master(dev), netif_has_l3_rx_handler(dev), dev->name);
-            goto drop;
-    }
+	/* based on l3mdev_ip_rcv; we are only interested in the master */
+	if (unlikely(!netif_is_l3_master(dev) && !netif_has_l3_rx_handler(dev))) {
+		goto drop;
+	}
 
-    if (unlikely(!dev->l3mdev_ops->l3mdev_l3_rcv)) {
-            goto drop;
-    }
+	if (unlikely(!dev->l3mdev_ops->l3mdev_l3_rcv)) {
+		goto drop;
+	}
 
-    /* the decap packet IPv4/IPv6 does not come with any mac header info.
-     * We must unset the mac header to allow the VRF device to rebuild it,
-     * just in case there is a sniffer attached on the device.
-     */
-    skb_reset_mac_header(skb);
+	/* the decap packet IPv4/IPv6 does not come with any mac header info.
+	 * We must unset the mac header to allow the VRF device to rebuild it,
+	 * just in case there is a sniffer attached on the device.
+	 */
+	skb_reset_mac_header(skb);
 
-    skb = dev->l3mdev_ops->l3mdev_l3_rcv(dev, skb, family);
-    if (!skb)
-            /* the skb buffer was consumed by the handler */
-            return NULL;
+	skb = dev->l3mdev_ops->l3mdev_l3_rcv(dev, skb, family);
+	if (!skb)
+		/* the skb buffer was consumed by the handler */
+		return NULL;
 
-    /* when a packet is received by a VRF or by one of its slaves, the
-     * master device reference is set into the skb.
-     */
-    if (unlikely(skb->dev != dev || skb->skb_iif != dev->ifindex)) {
-                    skb->dev->name, dev->name, skb->skb_iif, dev->ifindex);
-            goto drop;
-    }
+	/* when a packet is received by a VRF or by one of its slaves, the
+ 	 * master device reference is set into the skb.
+	 */
+	if (unlikely(skb->dev != dev || skb->skb_iif != dev->ifindex)) {
+		goto drop;
+	}
 
-    return skb;
+	return skb;
 
 drop:
 	kfree_skb(skb);
@@ -673,7 +723,6 @@ static struct sk_buff *end_dt_vrf_core(struct sk_buff *skb,
 {
 	struct net *net = dev_net(skb->dev);
 	struct net_device *vrf;
-
 
 	vrf = l3mdev_master_by_table(net, slwt->table);
 	if (! vrf) {
@@ -732,18 +781,6 @@ static int input_action_end_dt4(struct sk_buff *skb,
 		goto drop;
 
 #ifdef LEGACY_DT4
-	skb->protocol = htons(ETH_P_IP);
-	skb_dst_drop(skb);
-	skb_set_transport_header(skb, sizeof(struct iphdr));
-
-	iph = ip_hdr(skb);
-
-	err = ip_route_input_table(skb, iph->daddr, iph->saddr, 0, skb->dev,
-						slwt->table, 0);
-	if (unlikely(err)) {
-		goto drop;
-	}
-
 	if (slwt->table) {
 		net = dev_net(skb_dst(skb)->dev);
 
@@ -754,6 +791,18 @@ static int input_action_end_dt4(struct sk_buff *skb,
 		}
 
 		IPCB(skb)->flags |= IPSKB_L3SLAVE;
+	}
+
+	skb->protocol = htons(ETH_P_IP);
+	skb_dst_drop(skb);
+	skb_set_transport_header(skb, sizeof(struct iphdr));
+
+	iph = ip_hdr(skb);
+
+	err = ip_route_input_table(skb, iph->daddr, iph->saddr, 0, skb->dev,
+						slwt->table, 0);
+	if (unlikely(err)) {
+		goto drop;
 	}
 #else
 	skb = end_dt_vrf_core(skb, slwt, AF_INET);
@@ -788,8 +837,10 @@ static int input_action_end_dt6(struct sk_buff *skb,
 {
 	struct ipv6hdr *ip6;
 	u32 next_usid;
+#ifdef LEGACY_DT6
 	struct net *net;
 	struct net_device *dev;
+#endif
 
 	ip6 = ipv6_hdr(skb);
 	if (!ip6)
@@ -808,33 +859,34 @@ static int input_action_end_dt6(struct sk_buff *skb,
 	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
 		goto drop;
 
-#ifndef LEGACY_DT6
-	skb = end_dt_vrf_core(skb, slwt, AF_INET6);
-	if (!skb)
-		return 0
-
-	if (IS_ERR(skb))
-		return PTR_ERR(skb);
-
-	seg6_lookup_nexthop(skb, NULL, slwt->table);
-#else
-	skb_set_transport_header(skb, sizeof(struct ipv6hdr));
-
-	seg6_lookup_nexthop(skb, NULL, slwt->table);
-
+#ifdef LEGACY_DT6
 	if (slwt->table) {
 		net = dev_net(skb_dst(skb)->dev);
 
 		dev = l3mdev_master_by_table(net, slwt->table);
 		if (dev) {
 			skb->dev = dev;
-			IP6CB(skb)->iif = skb->skb_iif = dev->ifindex;
+			skb->skb_iif = dev->ifindex;
 		}
 
 		IP6CB(skb)->flags |= IP6SKB_L3SLAVE;
 	}
 
-    skb->skb_iif = skb_dst(skb)->dev->ifindex;
+	skb_set_transport_header(skb, sizeof(struct ipv6hdr));
+	skb->protocol = htons(ETH_P_IPV6);
+
+	skb_dst_drop(skb);
+
+	seg6_lookup_nexthop(skb, NULL, slwt->table);
+#else
+	skb = end_dt_vrf_core(skb, slwt, AF_INET6);
+	if (!skb)
+		return 0;
+
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+
+	seg6_lookup_nexthop(skb, NULL, slwt->table);
 #endif
 
 	return dst_input(skb);

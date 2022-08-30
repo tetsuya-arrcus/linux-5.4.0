@@ -2534,7 +2534,7 @@ static int ip_route_input_slow_table(struct sk_buff *skb, __be32 daddr, __be32 s
 	fl4.flowi4_multipath_hash = 0;
 
 	if (table) {
-		fl4.flowi4_oif = l3mdev_master_ifindex_by_table(net, table);
+		fl4.flowi4_iif = l3mdev_master_ifindex_by_table(net, table);
 	}
 
 	if (fib4_rules_early_flow_dissect(net, skb, &fl4, &_flkeys)) {
